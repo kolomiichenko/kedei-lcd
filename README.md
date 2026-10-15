@@ -60,7 +60,7 @@ init sequences and frame formats), 32-bit OS.
       power with the throttling cause (under-voltage or temperature limit),
       Docker, CPU load/clock/temperature, RAM and disk usage;
     - *Graphs*: last 30 minutes of CPU, temperature and network traffic;
-    - *Docker*: containers and their state;
+    - *Docker*: containers with start/stop buttons (tap twice to confirm);
     - *Settings*: background color, refresh interval, warning thresholds,
       touch calibration and touch test (saved to `/etc/kedei-ui.conf`).
   - **desktop** – full display: the console and an X11 desktop are rendered

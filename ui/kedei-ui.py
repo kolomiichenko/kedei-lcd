@@ -53,6 +53,9 @@ SETTINGS = {
 }
 SET_Y, SET_ROW = 44, 34
 SET_BUTTONS = {"calibrate": (10, 252, 232, 282), "test": (248, 252, 470, 282)}
+DOCKER_Y, DOCKER_ROW = 44, 40
+DOCKER_BUTTON_X = W - 110
+CONFIRM_S = 3  # a second tap within this time confirms start/stop
 
 EV_KEY, EV_ABS, BTN_TOUCH, ABS_X, ABS_Y = 1, 3, 0x14A, 0, 1
 
@@ -242,6 +245,14 @@ def uptime():
     return f"{d}d {h}h {s // 60}m" if d else f"{h}h {s // 60}m"
 
 
+def docker_action(action, name):
+    try:
+        subprocess.run(["docker", action, name], capture_output=True, timeout=60)
+    except Exception:
+        pass
+    _cache.pop((containers, ()), None)
+
+
 def containers():
     out = sh("docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Image}}")
     return [l.split("\t") for l in out.splitlines() if l.count("\t") == 3]
@@ -345,6 +356,8 @@ class UI:
         self.page = 0
         self.cfg = load_settings()
         self.touch_test = False  # touch test screen inside Settings
+        self.confirm = None  # (container, deadline) waiting for the second tap
+        self.busy = {}  # container -> "starting" / "stopping"
         self.taps = []  # recent taps on the touch test screen
         self.cal_step = None  # index into CAL_TARGETS while calibrating
         self.cal_msg = ""
@@ -365,7 +378,32 @@ class UI:
                 self.taps = (self.taps + [(x, y)])[-8:]
             elif PAGES[self.page] == "Settings":
                 self.settings_tap(x, y)
+            elif PAGES[self.page] == "Docker":
+                self.docker_tap(x, y)
         self.wake.set()
+
+    def docker_tap(self, x, y):
+        if x < DOCKER_BUTTON_X:
+            return
+        row = (y - DOCKER_Y) // DOCKER_ROW
+        cs = cached(10, containers)
+        if not 0 <= row < len(cs) or cs[row][0] in self.busy:
+            return
+        name, state = cs[row][0], cs[row][1]
+        if not self.confirm or self.confirm[0] != name or time.monotonic() > self.confirm[1]:
+            self.confirm = (name, time.monotonic() + CONFIRM_S)
+            return
+        self.confirm = None
+        action = "stop" if state == "running" else "start"
+        self.busy[name] = "stopping" if action == "stop" else "starting"
+
+        def run():
+            docker_action(action, name)
+            with self.lock:
+                self.busy.pop(name, None)
+            self.wake.set()
+
+        threading.Thread(target=run, daemon=True).start()
 
     def settings_tap(self, x, y):
         for name, (bx0, by0, bx1, by1) in SET_BUTTONS.items():
@@ -527,13 +565,27 @@ class UI:
         if not cs:
             d.text((10, 50), "no containers", font=self.font, fill=DIM)
             return
-        y = 44
-        for name, state, status, image in cs[: (H - TAB_H - 44) // 38]:
-            d.ellipse([10, y + 5, 22, y + 17], fill=OK if state == "running" else BAD)
-            d.text((30, y), name, font=self.font, fill=FG)
-            d.text((W - 10, y), status[:24], font=self.small, fill=DIM, anchor="ra")
-            d.text((30, y + 19), image[:48], font=self.small, fill=DIM)
-            y += 38
+        if self.confirm and time.monotonic() > self.confirm[1]:
+            self.confirm = None
+        y = DOCKER_Y
+        for name, state, status, image in cs[: (H - TAB_H - DOCKER_Y) // DOCKER_ROW]:
+            running = state == "running"
+            d.ellipse([10, y + 5, 22, y + 17], fill=OK if running else BAD)
+            d.text((30, y), name[:20], font=self.font, fill=FG)
+            d.text((30, y + 20), status[:30], font=self.small, fill=DIM)
+            box = [DOCKER_BUTTON_X, y + 2, W - 10, y + DOCKER_ROW - 6]
+            center = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+            if name in self.busy:
+                d.rectangle(box, outline=DIM, width=2)
+                d.text(center, self.busy[name] + "...", font=self.small, fill=DIM, anchor="mm")
+            elif self.confirm and self.confirm[0] == name:
+                d.rectangle(box, fill=WARN)
+                d.text(center, "sure?", font=self.font, fill=self.bg, anchor="mm")
+            else:
+                color = BAD if running else OK
+                d.rectangle(box, outline=color, width=2)
+                d.text(center, "Stop" if running else "Start", font=self.font, fill=color, anchor="mm")
+            y += DOCKER_ROW
 
     def crosshair(self, d, x, y, color, r=12):
         d.line([x - r, y, x + r, y], fill=color, width=2)
