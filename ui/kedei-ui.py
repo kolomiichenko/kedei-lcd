@@ -54,7 +54,7 @@ SETTINGS = {
     "theme": ("Background", list(range(len(THEMES))), 0, lambda v: THEMES[v][0], 0),
     "refresh": ("Refresh", [1, 2, 5, 10], 1, lambda v: f"{v} s", 0),
     "night": ("Night mode", ["off", "auto", "on"], "auto", str.capitalize, 0),
-    "night_from": ("Night from", [18, 19, 20, 21, 22, 23, 0, 1], 23, lambda v: f"{v:02d}:00", 0),
+    "night_from": ("Night from", [18, 19, 20, 21, 22, 23, 0, 1], 0, lambda v: f"{v:02d}:00", 0),
     "night_to": ("Night until", [5, 6, 7, 8, 9, 10], 7, lambda v: f"{v:02d}:00", 0),
     "sleep": ("Screen off", [0, 1, 2, 5, 10, 30], 0, lambda v: minutes(v, "Never"), 0),
     "lock": ("PIN lock", [0, 1, 5, 15, 60], 0, lambda v: minutes(v, "Off"), 1),
@@ -72,7 +72,7 @@ SET_BUTTONS = {"page": (10, 252, 150, 282), "calibrate": (160, 252, 315, 282),
 PIN_LEN = 4
 PIN_TRIES, PIN_BLOCK_S = 5, 30
 # Lock screen keypad: 3 x 4 keys below the PIN dots.
-KEYPAD = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "Del", "0", "Esc"]
+KEYPAD = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "Esc", "0", "Del"]
 KP_X, KP_Y, KP_W, KP_H = 90, 82, 100, 58
 DOCKER_Y, DOCKER_ROW = 44, 40
 DOCKER_BUTTON_X = W - 110
