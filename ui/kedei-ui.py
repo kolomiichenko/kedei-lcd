@@ -4,6 +4,7 @@
 Renders a 480x320 RGB565 frame that the kedei-lcd daemon puts on the screen
 and reads taps from the "KeDei Touch" input device."""
 
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ OUT = "/run/kedei/fb.raw"
 TOUCH_STATE = "/run/kedei/touch"
 CAL_PATH = "/etc/kedei-touch.conf"
 SETTINGS_PATH = "/etc/kedei-ui.conf"
+PIN_PATH = "/etc/kedei-ui.pin"
 W, H = 480, 320
 TAB_H = 36
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -42,17 +44,36 @@ CAL_TARGETS = [(30, 30), (450, 30), (450, 290), (30, 290), (240, 160)]
 
 THEMES = [("Black", (0, 0, 0)), ("Navy", (8, 16, 40)), ("Graphite", (32, 32, 36)),
           ("Forest", (6, 30, 18)), ("Plum", (34, 10, 34))]
-# key: (label, choices, default, format)
+
+def minutes(v, zero):
+    return zero if v == 0 else f"{v} min"
+
+
+# key: (label, choices, default, format, settings page)
 SETTINGS = {
-    "theme": ("Background", list(range(len(THEMES))), 0, lambda v: THEMES[v][0]),
-    "refresh": ("Refresh", [1, 2, 5, 10], 1, lambda v: f"{v} s"),
-    "temp_warn": ("Temp warn", list(range(50, 81, 5)), 65, lambda v: f"{v}°C"),
-    "temp_bad": ("Temp alert", list(range(55, 86, 5)), 75, lambda v: f"{v}°C"),
-    "use_warn": ("Usage warn", list(range(50, 96, 5)), 75, lambda v: f"{v}%"),
-    "use_bad": ("Usage alert", list(range(55, 100, 5)), 90, lambda v: f"{v}%"),
+    "theme": ("Background", list(range(len(THEMES))), 0, lambda v: THEMES[v][0], 0),
+    "refresh": ("Refresh", [1, 2, 5, 10], 1, lambda v: f"{v} s", 0),
+    "night": ("Night mode", ["off", "auto", "on"], "auto", str.capitalize, 0),
+    "night_from": ("Night from", [18, 19, 20, 21, 22, 23, 0, 1], 23, lambda v: f"{v:02d}:00", 0),
+    "night_to": ("Night until", [5, 6, 7, 8, 9, 10], 7, lambda v: f"{v:02d}:00", 0),
+    "sleep": ("Screen off", [0, 1, 2, 5, 10, 30], 0, lambda v: minutes(v, "Never"), 0),
+    "lock": ("PIN lock", [0, 1, 5, 15, 60], 0, lambda v: minutes(v, "Off"), 1),
+    "night_dim": ("Night bright", [10, 20, 30, 50, 70], 30, lambda v: f"{v}%", 1),
+    "temp_warn": ("Temp warn", list(range(50, 81, 5)), 65, lambda v: f"{v}°C", 1),
+    "temp_bad": ("Temp alert", list(range(55, 86, 5)), 75, lambda v: f"{v}°C", 1),
+    "use_warn": ("Usage warn", list(range(50, 96, 5)), 75, lambda v: f"{v}%", 1),
+    "use_bad": ("Usage alert", list(range(55, 100, 5)), 90, lambda v: f"{v}%", 1),
 }
+SET_PAGES = 2
 SET_Y, SET_ROW = 44, 34
-SET_BUTTONS = {"calibrate": (10, 252, 232, 282), "test": (248, 252, 470, 282)}
+SET_BUTTONS = {"page": (10, 252, 150, 282), "calibrate": (160, 252, 315, 282),
+               "test": (325, 252, 470, 282)}
+
+PIN_LEN = 4
+PIN_TRIES, PIN_BLOCK_S = 5, 30
+# Lock screen keypad: 3 x 4 keys below the PIN dots.
+KEYPAD = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "Del", "0", "Esc"]
+KP_X, KP_Y, KP_W, KP_H = 90, 82, 100, 58
 DOCKER_Y, DOCKER_ROW = 44, 40
 DOCKER_BUTTON_X = W - 110
 CONFIRM_S = 3  # a second tap within this time confirms start/stop
@@ -141,13 +162,45 @@ def load_settings():
     except (OSError, ValueError):
         saved = {}
     return {k: saved[k] if saved.get(k) in choices else default
-            for k, (_, choices, default, _) in SETTINGS.items()}
+            for k, (_, choices, default, _, _) in SETTINGS.items()}
 
 
 def save_settings(cfg):
     with open(SETTINGS_PATH + ".tmp", "w") as f:
         json.dump(cfg, f)
     os.replace(SETTINGS_PATH + ".tmp", SETTINGS_PATH)
+
+
+def pin_hash(pin, salt):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, 20000).hex()
+
+
+def pin_is_set():
+    return os.path.exists(PIN_PATH)
+
+
+def save_pin(pin):
+    salt = os.urandom(16)
+    fd = os.open(PIN_PATH + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"salt": salt.hex(), "hash": pin_hash(pin, salt)}, f)
+    os.replace(PIN_PATH + ".tmp", PIN_PATH)
+
+
+def check_pin(pin):
+    try:
+        with open(PIN_PATH) as f:
+            data = json.load(f)
+        return pin_hash(pin, bytes.fromhex(data["salt"])) == data["hash"]
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def night_active(cfg):
+    if cfg["night"] != "auto":
+        return cfg["night"] == "on"
+    h, start, end = time.localtime().tm_hour, cfg["night_from"], cfg["night_to"]
+    return start <= h < end if start < end else h >= start or h < end
 
 
 def cpu_times():
@@ -353,8 +406,20 @@ class UI:
         self.font = ImageFont.truetype(FONT, 18)
         self.small = ImageFont.truetype(FONT, 15)
         self.bold = ImageFont.truetype(FONT_BOLD, 22)
+        self.big = ImageFont.truetype(FONT_BOLD, 30)
         self.page = 0
+        self.set_page = 0  # settings sub-page
         self.cfg = load_settings()
+        self.last_touch = time.monotonic()
+        self.sleeping = False
+        # PIN screen: None, "unlock", "new" or "repeat" (setting a new PIN).
+        self.pin_mode = "unlock" if self.cfg["lock"] and pin_is_set() else None
+        self.pin_buf = ""
+        self.pin_first = ""
+        self.pin_msg = ""
+        self.pin_fails = 0
+        self.pin_block_until = 0.0
+        self.pin_lock_value = 0  # "lock" setting applied once the new PIN is confirmed
         self.touch_test = False  # touch test screen inside Settings
         self.confirm = None  # (container, deadline) waiting for the second tap
         self.busy = {}  # container -> "starting" / "stopping"
@@ -369,9 +434,14 @@ class UI:
     # Tap handling runs on the touch thread.
     def on_tap(self, x, y):
         with self.lock:
+            self.last_touch = time.monotonic()
             if self.cal_step is not None:
                 return  # calibration reads raw values itself
-            if y >= H - TAB_H:
+            if self.sleeping:
+                self.sleeping = False  # this tap only wakes the screen up
+            elif self.pin_mode:
+                self.pin_tap(x, y)
+            elif y >= H - TAB_H:
                 self.page = min(x * len(PAGES) // W, len(PAGES) - 1)
                 self.touch_test = False
             elif self.touch_test:
@@ -405,22 +475,83 @@ class UI:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def settings_keys(self):
+        return [k for k, v in SETTINGS.items() if v[4] == self.set_page]
+
     def settings_tap(self, x, y):
         for name, (bx0, by0, bx1, by1) in SET_BUTTONS.items():
             if bx0 <= x <= bx1 and by0 <= y <= by1:
-                if name == "calibrate":
+                if name == "page":
+                    self.set_page = (self.set_page + 1) % SET_PAGES
+                elif name == "calibrate":
                     threading.Thread(target=self.calibrate, daemon=True).start()
                 else:
                     self.touch_test, self.taps, self.cal_msg = True, [], ""
                 return
         row = (y - SET_Y) // SET_ROW
-        keys = list(SETTINGS)
+        keys = self.settings_keys()
         if 0 <= row < len(keys) and x >= 250:
             key = keys[row]
             choices = SETTINGS[key][1]
             i = choices.index(self.cfg[key]) + (1 if x >= 370 else -1)
-            self.cfg[key] = choices[max(0, min(i, len(choices) - 1))]
+            value = choices[max(0, min(i, len(choices) - 1))]
+            if key == "lock" and value and (not self.cfg["lock"] or not pin_is_set()):
+                # Turning the lock on: set a PIN first, apply the setting after.
+                self.pin_mode, self.pin_buf, self.pin_msg = "new", "", ""
+                self.pin_lock_value = value
+                return
+            self.cfg[key] = value
             save_settings(self.cfg)
+
+    def pin_tap(self, x, y):
+        col, row = (x - KP_X) // KP_W, (y - KP_Y) // KP_H
+        if not (x >= KP_X and 0 <= col < 3 and 0 <= row < 4):
+            return
+        key = KEYPAD[row * 3 + col]
+        if self.pin_mode == "unlock" and time.monotonic() < self.pin_block_until:
+            return
+        if key == "Del":
+            self.pin_buf = self.pin_buf[:-1]
+        elif key == "Esc":
+            self.pin_buf = ""
+            if self.pin_mode != "unlock":
+                self.pin_mode, self.pin_msg = None, ""  # cancel setting a PIN
+        elif len(self.pin_buf) < PIN_LEN:
+            self.pin_buf += key
+            if len(self.pin_buf) == PIN_LEN:
+                self.pin_entered()
+
+    def pin_entered(self):
+        pin, self.pin_buf = self.pin_buf, ""
+        if self.pin_mode == "unlock":
+            if check_pin(pin):
+                self.pin_mode, self.pin_msg, self.pin_fails = None, "", 0
+                return
+            self.pin_fails += 1
+            self.pin_msg = "wrong PIN"
+            if self.pin_fails >= PIN_TRIES:
+                self.pin_fails = 0
+                self.pin_block_until = time.monotonic() + PIN_BLOCK_S
+        elif self.pin_mode == "new":
+            self.pin_first, self.pin_mode, self.pin_msg = pin, "repeat", ""
+        elif pin == self.pin_first:
+            save_pin(pin)
+            self.cfg["lock"] = self.pin_lock_value
+            save_settings(self.cfg)
+            self.pin_mode, self.pin_msg = None, ""
+        else:
+            self.pin_mode, self.pin_msg = "new", "PINs differ, try again"
+
+    def update_idle(self):
+        """Locks and blanks the screen after the configured idle time."""
+        idle = time.monotonic() - self.last_touch
+        if self.cal_step is not None:
+            return
+        if self.cfg["lock"] and not self.pin_mode and pin_is_set() and idle > self.cfg["lock"] * 60:
+            self.pin_mode, self.pin_buf, self.pin_msg = "unlock", "", ""
+            self.page, self.touch_test = 0, False
+        if self.cfg["sleep"] and idle > self.cfg["sleep"] * 60:
+            self.sleeping = True
 
     def calibrate(self):
         raw = []
@@ -604,7 +735,8 @@ class UI:
             self.page_touch_test(d)
             return
         self.header(d, "Settings")
-        for i, (key, (label, _, _, fmt)) in enumerate(SETTINGS.items()):
+        for i, key in enumerate(self.settings_keys()):
+            label, _, _, fmt, _ = SETTINGS[key]
             y = SET_Y + i * SET_ROW
             d.text((10, y + 15), label, font=self.font, fill=FG, anchor="lm")
             for bx, sym in ((250, "<"), (426, ">")):
@@ -613,7 +745,8 @@ class UI:
             d.text((360, y + 15), fmt(self.cfg[key]), font=self.font, fill=FG, anchor="mm")
             if key == "theme":
                 d.rectangle([200, y + 4, 222, y + 26], fill=THEMES[self.cfg[key]][1], outline=DIM)
-        for name, label in (("calibrate", "Calibrate touch"), ("test", "Touch test")):
+        page_label = f"Page {self.set_page + 1}/{SET_PAGES}"
+        for name, label in (("page", page_label), ("calibrate", "Calibrate"), ("test", "Touch test")):
             box = SET_BUTTONS[name]
             d.rectangle(box, outline=ACCENT, width=2)
             d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), label,
@@ -631,14 +764,48 @@ class UI:
             x, y = self.taps[-1]
             d.text((10, H - TAB_H - 26), f"x={x:3d}  y={y:3d}", font=self.bold, fill=WARN)
 
+    def page_pin(self, d):
+        title = {"unlock": "Locked", "new": "New PIN", "repeat": "Repeat PIN"}[self.pin_mode]
+        self.header(d, title)
+        wait = self.pin_block_until - time.monotonic()
+        msg = f"too many tries, wait {wait:.0f} s" if wait > 0 else self.pin_msg
+        if msg:
+            d.text((10, 40), msg, font=self.small, fill=BAD)
+        for i in range(PIN_LEN):
+            cx = W // 2 + (i - (PIN_LEN - 1) / 2) * 30
+            box = [cx - 8, 60, cx + 8, 76]
+            if i < len(self.pin_buf):
+                d.ellipse(box, fill=FG)
+            else:
+                d.ellipse(box, outline=DIM, width=2)
+        for i, key in enumerate(KEYPAD):
+            if key == "Esc" and self.pin_mode == "unlock" and not self.pin_buf:
+                continue
+            col, row = i % 3, i // 3
+            box = [KP_X + col * KP_W + 3, KP_Y + row * KP_H + 3,
+                   KP_X + (col + 1) * KP_W - 3, KP_Y + (row + 1) * KP_H - 3]
+            d.rectangle(box, outline=ACCENT if key.isdigit() else DIM, width=2)
+            d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), key,
+                   font=self.big if key.isdigit() else self.font,
+                   fill=FG if key.isdigit() else DIM, anchor="mm")
+
     def render(self):
         self.bg = THEMES[self.cfg["theme"]][1]
-        img = Image.new("RGB", (W, H), self.bg)
-        d = ImageDraw.Draw(img)
         with self.lock:
-            [self.page_status, self.page_graphs, self.page_docker, self.page_settings][self.page](d)
-            if self.cal_step is None:
-                self.draw_tabs(d)
+            self.update_idle()
+            if self.sleeping:
+                return Image.new("RGB", (W, H), (0, 0, 0))
+            img = Image.new("RGB", (W, H), self.bg)
+            d = ImageDraw.Draw(img)
+            if self.pin_mode:
+                self.page_pin(d)
+            else:
+                [self.page_status, self.page_graphs, self.page_docker, self.page_settings][self.page](d)
+                if self.cal_step is None:
+                    self.draw_tabs(d)
+        if night_active(self.cfg):
+            k = self.cfg["night_dim"] / 100
+            img = img.point(lambda v: int(v * k))
         return img
 
 

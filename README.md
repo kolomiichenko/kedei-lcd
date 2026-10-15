@@ -61,8 +61,10 @@ init sequences and frame formats), 32-bit OS.
       Docker, CPU load/clock/temperature, RAM and disk usage;
     - *Graphs*: last 30 minutes of CPU, temperature and network traffic;
     - *Docker*: containers with start/stop buttons (tap twice to confirm);
-    - *Settings*: background color, refresh interval, warning thresholds,
-      touch calibration and touch test (saved to `/etc/kedei-ui.conf`).
+    - *Settings*: background color, refresh interval, night mode (dimmed
+      colors on a schedule), screen off after inactivity, PIN lock with an
+      on-screen keypad, warning thresholds, touch calibration and touch test
+      (saved to `/etc/kedei-ui.conf`, PIN hash in `/etc/kedei-ui.pin`).
   - **desktop** – full display: the console and an X11 desktop are rendered
     into the system framebuffer and mirrored to the LCD; the touchscreen
     clicks and drags like a mouse.
