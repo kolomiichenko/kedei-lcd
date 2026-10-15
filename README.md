@@ -55,8 +55,10 @@ init sequences and frame formats), 32-bit OS.
 - Touchscreen: X/Y/pressure, exposed as a standard input device
   (`KeDei Touch`, via `uinput`), works with a finger or the stylus.
 - Two modes:
-  - **ui** – lightweight touch UI with tabs: system status (IP, Wi-Fi, CPU,
-    temperature, RAM, disk, power), Docker containers, touch test and
+  - **ui** – lightweight touch UI with tabs: system status (IP, Wi-Fi, CPU
+    load/clock/temperature, RAM, disk, power with the throttling cause:
+    under-voltage or temperature limit), 30-minute graphs of CPU,
+    temperature and network traffic, Docker containers, touch test and
     on-screen calibration.
   - **desktop** – full display: the console and an X11 desktop are rendered
     into the system framebuffer and mirrored to the LCD; the touchscreen

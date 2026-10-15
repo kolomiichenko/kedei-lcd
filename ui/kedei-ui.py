@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""kedei-ui: touch UI for the KeDei LCD (status / docker / touch pages).
+"""kedei-ui: touch UI for the KeDei LCD (status / graphs / docker / touch pages).
 
 Renders a 480x320 RGB565 frame that the kedei-lcd daemon puts on the screen
 and reads taps from the "KeDei Touch" input device."""
@@ -12,6 +12,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
@@ -32,7 +33,7 @@ WARN = (255, 190, 0)
 BAD = (255, 70, 70)
 TAB_BG = (30, 30, 40)
 
-PAGES = ["Status", "Docker", "Touch"]
+PAGES = ["Status", "Graphs", "Docker", "Touch"]
 # Calibration targets: inset corners, then the center for verification.
 CAL_TARGETS = [(30, 30), (450, 30), (450, 290), (30, 290), (240, 160)]
 CAL_BUTTON = (W - 150, 50, W - 10, 90)
@@ -75,19 +76,79 @@ def wifi():
     return ssid, sig
 
 
-_cpu_prev = None
-
-
-def cpu_usage():
-    global _cpu_prev
+def cpu_times():
     fields = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:]]
-    idle, total = fields[3] + fields[4], sum(fields)
-    usage = 0.0
-    if _cpu_prev:
-        di, dt = idle - _cpu_prev[0], total - _cpu_prev[1]
-        usage = 100.0 * (1 - di / dt) if dt else 0.0
-    _cpu_prev = (idle, total)
-    return usage
+    return fields[3] + fields[4], sum(fields)
+
+
+def net_bytes():
+    rx = tx = 0
+    for line in read("/proc/net/dev").splitlines()[2:]:
+        name, data = line.split(":", 1)
+        if name.strip() in ("wlan0", "eth0"):
+            f = data.split()
+            rx, tx = rx + int(f[0]), tx + int(f[8])
+    return rx, tx
+
+
+def temperature():
+    return int(read("/sys/class/thermal/thermal_zone0/temp") or 0) / 1000
+
+
+def cpu_mhz():
+    return int(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") or 0) // 1000
+
+
+# vcgencmd get_throttled bits: 0-3 happening now, 16-19 happened since boot.
+THROTTLE_BITS = [(0, "undervolt"), (3, "temp limit"), (2, "throttled"), (1, "freq capped")]
+
+
+def power_status(raw):
+    try:
+        t = int(raw, 16)
+    except ValueError:
+        return "unknown", DIM
+    now = [n for b, n in THROTTLE_BITS if t & (1 << b)]
+    if now:
+        # "throttled"/"freq capped" only repeat the cause, show them when alone.
+        cause = [n for n in now if n in ("undervolt", "temp limit")] or now
+        return " + ".join(cause).upper(), BAD
+    past = [n for b, n in THROTTLE_BITS[:2] if t & (1 << (b + 16))]
+    if past:
+        return "OK (was: " + ", ".join(past) + ")", WARN
+    return "OK", OK
+
+
+class Sampler(threading.Thread):
+    """Collects CPU/temperature/network history for the Graphs page."""
+
+    PERIOD = 10  # seconds
+    SIZE = 180   # 30 minutes
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.cpu = deque(maxlen=self.SIZE)
+        self.temp = deque(maxlen=self.SIZE)
+        self.rx = deque(maxlen=self.SIZE)
+        self.tx = deque(maxlen=self.SIZE)
+        self.mhz = 0
+
+    def run(self):
+        idle0, total0 = cpu_times()
+        rx0, tx0 = net_bytes()
+        t0 = time.monotonic()
+        while True:
+            time.sleep(self.PERIOD)
+            idle, total = cpu_times()
+            rx, tx = net_bytes()
+            t = time.monotonic()
+            dt, di = total - total0, idle - idle0
+            self.cpu.append(100.0 * (1 - di / dt) if dt else 0.0)
+            self.temp.append(temperature())
+            self.rx.append((rx - rx0) / (t - t0) / 1024)
+            self.tx.append((tx - tx0) / (t - t0) / 1024)
+            self.mhz = cpu_mhz()
+            idle0, total0, rx0, tx0, t0 = idle, total, rx, tx, t
 
 
 def mem():
@@ -205,6 +266,8 @@ class UI:
         self.cal_msg = ""
         self.wake = threading.Event()
         self.lock = threading.Lock()
+        self.stats = Sampler()
+        self.stats.start()
 
     # Tap handling runs on the touch thread.
     def on_tap(self, x, y):
@@ -259,20 +322,19 @@ class UI:
     def page_status(self, d):
         self.header(d, socket.gethostname())
         ssid, sig = wifi()
-        temp = int(read("/sys/class/thermal/thermal_zone0/temp") or 0) / 1000
-        cpu = cpu_usage()
+        temp = temperature()
+        cpu = self.stats.cpu[-1] if self.stats.cpu else 0.0
         used, total = mem()
         du = shutil.disk_usage("/")
         disk_pct = 100 * du.used / du.total
-        throttled = sh("vcgencmd", "get_throttled").split("=")[-1]
+        power, power_color = power_status(sh("vcgencmd", "get_throttled").split("=")[-1])
         cs = containers()
-        power_ok = throttled in ("0x0", "")
         y = 42
         for label, value, color in [
             ("IP", ip_addr(), FG),
             ("WiFi", f"{ssid} {sig}", FG),
             ("Up", uptime(), FG),
-            ("Power", "OK" if power_ok else f"throttled {throttled}", OK if power_ok else BAD),
+            ("Power", power, power_color),
             ("Docker", f"{sum(c[1] == 'running' for c in cs)}/{len(cs)} running", FG),
         ]:
             d.text((10, y), label, font=self.font, fill=DIM)
@@ -280,14 +342,56 @@ class UI:
             y += 22
         y += 4
         for label, text, pct, color in [
-            ("CPU", f"{cpu:3.0f}%  {temp:.0f}°C", cpu, level(max(cpu, temp), 70, 85)),
+            ("CPU", f"{cpu:3.0f}% {cpu_mhz():4d}MHz {temp:.0f}°C", cpu, level(max(cpu, temp), 70, 85)),
             ("RAM", f"{used}/{total}MB", 100 * used / total, level(100 * used / total, 75, 90)),
             ("Disk", f"{du.used / 2**30:.1f}/{du.total / 2**30:.0f}GB", disk_pct, level(disk_pct, 80, 90)),
         ]:
             d.text((10, y), label, font=self.font, fill=DIM)
             self.bar(d, 90, y + 5, 150, pct, color)
-            d.text((252, y), text, font=self.font, fill=FG)
+            d.text((252, y), text, font=self.small if label == "CPU" else self.font, fill=FG)
             y += 22
+
+    def chart(self, d, top, height, title, series, vmin, vmax, marks=()):
+        """Draws one history chart. series: [(values, color)], marks: [(value, color)]."""
+        x0, x1 = 10, W - 10
+        y0, y1 = top + 18, top + height
+        d.text((x0, top), title, font=self.small, fill=FG)
+        d.rectangle([x0, y0, x1, y1], outline=TAB_BG)
+        span = max(vmax - vmin, 1e-9)
+
+        def py(v):
+            return y1 - 1 - (min(max(v, vmin), vmax) - vmin) / span * (y1 - y0 - 2)
+
+        for v, color in marks:
+            y = py(v)
+            for x in range(x0 + 1, x1, 6):
+                d.line([x, y, x + 2, y], fill=color)
+        step = (x1 - x0 - 2) / (Sampler.SIZE - 1)
+        for values, color in series:
+            vals = list(values)
+            off = Sampler.SIZE - len(vals)
+            pts = [(x0 + 1 + (off + i) * step, py(v)) for i, v in enumerate(vals)]
+            if len(pts) > 1:
+                d.line(pts, fill=color, width=2)
+            elif pts:
+                d.point(pts, fill=color)
+
+    def page_graphs(self, d):
+        self.header(d, "Last 30 min")
+        st = self.stats
+        if not st.cpu:
+            d.text((10, 50), "collecting...", font=self.font, fill=DIM)
+            return
+        cpu, temp, rx, tx = st.cpu[-1], st.temp[-1], st.rx[-1], st.tx[-1]
+        self.chart(d, 40, 76, f"CPU {cpu:3.0f}%  {st.mhz}MHz  max {max(st.cpu):.0f}%",
+                   [(st.cpu, ACCENT)], 0, 100)
+        lo = min(min(st.temp), 40)
+        hi = max(max(st.temp), 70)
+        self.chart(d, 120, 76, f"Temp {temp:.1f}°C  max {max(st.temp):.1f}°C  limit 70",
+                   [(st.temp, level(temp, 65, 75))], lo, hi, marks=[(70, BAD), (60, WARN)])
+        net_max = max(max(st.rx), max(st.tx), 16)
+        self.chart(d, 200, 78, f"Net \u2193{rx:6.1f} \u2191{tx:6.1f} KB/s",
+                   [(st.rx, OK), (st.tx, WARN)], 0, net_max)
 
     def page_docker(self, d):
         self.header(d, "Docker")
@@ -335,7 +439,7 @@ class UI:
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
         with self.lock:
-            [self.page_status, self.page_docker, self.page_touch][self.page](d)
+            [self.page_status, self.page_graphs, self.page_docker, self.page_touch][self.page](d)
             if self.cal_step is None:
                 self.draw_tabs(d)
         return img
