@@ -143,3 +143,16 @@ back to a plain output (high) and the next LCD frame must set the window again.
 
 On the tested board the touch axes are swapped relative to the landscape
 screen (raw Y follows screen X, raw X decreases from top to bottom).
+
+## Backlight
+
+The backlight is always on: it is powered from 5V and not controlled by
+software. Tested on the 2018/4/9 board without any visible change:
+
+- controller backlight/PWM commands: `B9` with different duty values,
+  `53` (BCTRL) + `51` (brightness);
+- each of the 13 unused 74HC595 outputs (all bits of byte 0, bits 1, 3, 5, 6
+  and 7 of byte 1) latched for 3 s.
+
+The vendor driver has no backlight code either. Dimming needs a hardware
+change (a transistor in the backlight supply driven by a PWM pin).
