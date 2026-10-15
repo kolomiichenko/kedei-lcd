@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""kedei-ui: touch UI for the KeDei LCD (status / graphs / docker / touch pages).
+"""kedei-ui: touch UI for the KeDei LCD (status / graphs / docker / settings pages).
 
 Renders a 480x320 RGB565 frame that the kedei-lcd daemon puts on the screen
 and reads taps from the "KeDei Touch" input device."""
 
+import json
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -12,6 +14,7 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.request
 from collections import deque
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -19,12 +22,12 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 OUT = "/run/kedei/fb.raw"
 TOUCH_STATE = "/run/kedei/touch"
 CAL_PATH = "/etc/kedei-touch.conf"
+SETTINGS_PATH = "/etc/kedei-ui.conf"
 W, H = 480, 320
 TAB_H = 36
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 
-BG = (0, 0, 0)
 FG = (230, 230, 230)
 DIM = (140, 140, 140)
 ACCENT = (0, 200, 255)
@@ -33,10 +36,23 @@ WARN = (255, 190, 0)
 BAD = (255, 70, 70)
 TAB_BG = (30, 30, 40)
 
-PAGES = ["Status", "Graphs", "Docker", "Touch"]
+PAGES = ["Status", "Graphs", "Docker", "Settings"]
 # Calibration targets: inset corners, then the center for verification.
 CAL_TARGETS = [(30, 30), (450, 30), (450, 290), (30, 290), (240, 160)]
-CAL_BUTTON = (W - 150, 50, W - 10, 90)
+
+THEMES = [("Black", (0, 0, 0)), ("Navy", (8, 16, 40)), ("Graphite", (32, 32, 36)),
+          ("Forest", (6, 30, 18)), ("Plum", (34, 10, 34))]
+# key: (label, choices, default, format)
+SETTINGS = {
+    "theme": ("Background", list(range(len(THEMES))), 0, lambda v: THEMES[v][0]),
+    "refresh": ("Refresh", [1, 2, 5, 10], 1, lambda v: f"{v} s"),
+    "temp_warn": ("Temp warn", list(range(50, 81, 5)), 65, lambda v: f"{v}°C"),
+    "temp_bad": ("Temp alert", list(range(55, 86, 5)), 75, lambda v: f"{v}°C"),
+    "use_warn": ("Usage warn", list(range(50, 96, 5)), 75, lambda v: f"{v}%"),
+    "use_bad": ("Usage alert", list(range(55, 100, 5)), 90, lambda v: f"{v}%"),
+}
+SET_Y, SET_ROW = 44, 34
+SET_BUTTONS = {"calibrate": (10, 252, 232, 282), "test": (248, 252, 470, 282)}
 
 EV_KEY, EV_ABS, BTN_TOUCH, ABS_X, ABS_Y = 1, 3, 0x14A, 0, 1
 
@@ -69,11 +85,66 @@ def ip_addr():
         s.close()
 
 
+_cache = {}
+
+
+def cached(ttl, fn, *args):
+    """Returns fn(*args), recomputed at most every ttl seconds."""
+    now = time.monotonic()
+    hit = _cache.get((fn, args))
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = fn(*args)
+    _cache[(fn, args)] = (now, value)
+    return value
+
+
 def wifi():
     link = sh("iw", "dev", "wlan0", "link")
     ssid = next((l.split(":", 1)[1].strip() for l in link.splitlines() if "SSID" in l), "-")
-    sig = next((l.split(":", 1)[1].strip() for l in link.splitlines() if "signal" in l), "")
-    return ssid, sig
+    m = re.search(r"signal:\s*(-?\d+)", link)
+    return ssid, int(m.group(1)) if m else None
+
+
+def wifi_bars(dbm):
+    if dbm is None:
+        return 0
+    return sum(dbm >= t for t in (-85, -75, -65, -55))
+
+
+def ping_ms(host="1.1.1.1"):
+    m = re.search(r"time=([\d.]+)", sh("ping", "-c1", "-W1", host))
+    return float(m.group(1)) if m else None
+
+
+def wan_info():
+    """External IP and country, or None when offline."""
+    try:
+        with urllib.request.urlopen("https://ipinfo.io/json", timeout=5) as r:
+            j = json.load(r)
+        return j.get("ip", "?"), j.get("country", "")
+    except Exception:
+        return None
+
+
+def throttled():
+    return sh("vcgencmd", "get_throttled").split("=")[-1]
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    return {k: saved[k] if saved.get(k) in choices else default
+            for k, (_, choices, default, _) in SETTINGS.items()}
+
+
+def save_settings(cfg):
+    with open(SETTINGS_PATH + ".tmp", "w") as f:
+        json.dump(cfg, f)
+    os.replace(SETTINGS_PATH + ".tmp", SETTINGS_PATH)
 
 
 def cpu_times():
@@ -132,6 +203,9 @@ class Sampler(threading.Thread):
         self.rx = deque(maxlen=self.SIZE)
         self.tx = deque(maxlen=self.SIZE)
         self.mhz = 0
+        self.ping = None
+        self.wan = None
+        self.wan_at = -1e9
 
     def run(self):
         idle0, total0 = cpu_times()
@@ -148,6 +222,10 @@ class Sampler(threading.Thread):
             self.rx.append((rx - rx0) / (t - t0) / 1024)
             self.tx.append((tx - tx0) / (t - t0) / 1024)
             self.mhz = cpu_mhz()
+            self.ping = ping_ms()
+            # External IP: every 30 min, retry every minute while offline.
+            if t - self.wan_at > (1800 if self.wan else 60):
+                self.wan, self.wan_at = wan_info(), t
             idle0, total0, rx0, tx0, t0 = idle, total, rx, tx, t
 
 
@@ -171,6 +249,10 @@ def containers():
 
 def level(v, warn, bad):
     return BAD if v >= bad else WARN if v >= warn else OK
+
+
+def worst(*colors):
+    return next((c for c in (BAD, WARN) if c in colors), OK)
 
 
 # --- touch input -------------------------------------------------------------
@@ -261,7 +343,9 @@ class UI:
         self.small = ImageFont.truetype(FONT, 15)
         self.bold = ImageFont.truetype(FONT_BOLD, 22)
         self.page = 0
-        self.taps = []  # recent taps on the Touch page
+        self.cfg = load_settings()
+        self.touch_test = False  # touch test screen inside Settings
+        self.taps = []  # recent taps on the touch test screen
         self.cal_step = None  # index into CAL_TARGETS while calibrating
         self.cal_msg = ""
         self.wake = threading.Event()
@@ -276,13 +360,29 @@ class UI:
                 return  # calibration reads raw values itself
             if y >= H - TAB_H:
                 self.page = min(x * len(PAGES) // W, len(PAGES) - 1)
-            elif PAGES[self.page] == "Touch":
-                bx0, by0, bx1, by1 = CAL_BUTTON
-                if bx0 <= x <= bx1 and by0 <= y <= by1:
+                self.touch_test = False
+            elif self.touch_test:
+                self.taps = (self.taps + [(x, y)])[-8:]
+            elif PAGES[self.page] == "Settings":
+                self.settings_tap(x, y)
+        self.wake.set()
+
+    def settings_tap(self, x, y):
+        for name, (bx0, by0, bx1, by1) in SET_BUTTONS.items():
+            if bx0 <= x <= bx1 and by0 <= y <= by1:
+                if name == "calibrate":
                     threading.Thread(target=self.calibrate, daemon=True).start()
                 else:
-                    self.taps = (self.taps + [(x, y)])[-8:]
-        self.wake.set()
+                    self.touch_test, self.taps, self.cal_msg = True, [], ""
+                return
+        row = (y - SET_Y) // SET_ROW
+        keys = list(SETTINGS)
+        if 0 <= row < len(keys) and x >= 250:
+            key = keys[row]
+            choices = SETTINGS[key][1]
+            i = choices.index(self.cfg[key]) + (1 if x >= 370 else -1)
+            self.cfg[key] = choices[max(0, min(i, len(choices) - 1))]
+            save_settings(self.cfg)
 
     def calibrate(self):
         raw = []
@@ -298,6 +398,7 @@ class UI:
         with self.lock:
             self.cal_step = None
             self.taps = []
+            self.touch_test = True  # let the user check the result right away
             self.cal_msg = "saved: " + " ".join(map(str, cal))
         self.wake.set()
 
@@ -308,48 +409,73 @@ class UI:
             active = i == self.page
             d.rectangle([x0, H - TAB_H, x0 + tw - 1, H - 1], fill=ACCENT if active else TAB_BG)
             d.text((x0 + tw // 2, H - TAB_H // 2), name, font=self.font,
-                   fill=BG if active else FG, anchor="mm")
+                   fill=self.bg if active else FG, anchor="mm")
 
     def header(self, d, title):
         d.text((10, 6), title, font=self.bold, fill=ACCENT)
-        d.text((W - 10, 6), time.strftime("%H:%M:%S"), font=self.bold, fill=FG, anchor="ra")
+        clock = time.strftime("%H:%M:%S")
+        d.text((W - 10, 6), clock, font=self.bold, fill=FG, anchor="ra")
+        d.text((W - 18 - d.textlength(clock, font=self.bold), 12), time.strftime("%a %d %b"),
+               font=self.small, fill=DIM, anchor="ra")
         d.line([10, 36, W - 10, 36], fill=DIM)
 
     def bar(self, d, x, y, w, pct, color):
         d.rectangle([x, y, x + w, y + 10], outline=DIM)
         d.rectangle([x + 1, y + 1, x + 1 + int((w - 2) * min(pct, 100) / 100), y + 9], fill=color)
 
+    def signal_icon(self, d, x, y, bars):
+        for i in range(4):
+            h = 4 + i * 4
+            box = [x + i * 6, y + 16 - h, x + i * 6 + 3, y + 16]
+            d.rectangle(box, fill=FG if i < bars else TAB_BG)
+
     def page_status(self, d):
         self.header(d, socket.gethostname())
-        ssid, sig = wifi()
+        c = self.cfg
+        st = self.stats
+        ssid, dbm = cached(5, wifi)
         temp = temperature()
-        cpu = self.stats.cpu[-1] if self.stats.cpu else 0.0
+        cpu = st.cpu[-1] if st.cpu else 0.0
         used, total = mem()
-        du = shutil.disk_usage("/")
+        ram_pct = 100 * used / total
+        du = cached(30, shutil.disk_usage, "/")
         disk_pct = 100 * du.used / du.total
-        power, power_color = power_status(sh("vcgencmd", "get_throttled").split("=")[-1])
-        cs = containers()
-        y = 42
-        for label, value, color in [
-            ("IP", ip_addr(), FG),
-            ("WiFi", f"{ssid} {sig}", FG),
-            ("Up", uptime(), FG),
+        power, power_color = power_status(cached(5, throttled))
+        cs = cached(10, containers)
+        load = read("/proc/loadavg").split()[0]
+        wan = f"{st.wan[0]} {st.wan[1]}" if st.wan else "offline" if st.cpu else "..."
+        ping = f"  {st.ping:.0f}ms" if st.ping is not None else ""
+        rows = [
+            ("IP", cached(30, ip_addr), FG),
+            ("WAN", wan + ping, FG),
+            ("WiFi", None, FG),
+            ("Up", f"{uptime()}  load {load}", FG),
             ("Power", power, power_color),
-            ("Docker", f"{sum(c[1] == 'running' for c in cs)}/{len(cs)} running", FG),
-        ]:
+            ("Docker", f"{sum(x[1] == 'running' for x in cs)}/{len(cs)} running", FG),
+        ]
+        y = 42
+        for label, value, color in rows:
             d.text((10, y), label, font=self.font, fill=DIM)
-            d.text((90, y), value, font=self.font, fill=color)
+            if label == "WiFi":
+                self.signal_icon(d, 90, y + 1, wifi_bars(dbm))
+                sig = f"  {dbm}dBm" if dbm is not None else ""
+                d.text((120, y), f"{ssid}{sig}", font=self.font, fill=FG)
+            else:
+                d.text((90, y), value, font=self.font, fill=color)
             y += 22
-        y += 4
+        y += 6
+        use = (c["use_warn"], c["use_bad"])
         for label, text, pct, color in [
-            ("CPU", f"{cpu:3.0f}% {cpu_mhz():4d}MHz {temp:.0f}°C", cpu, level(max(cpu, temp), 70, 85)),
-            ("RAM", f"{used}/{total}MB", 100 * used / total, level(100 * used / total, 75, 90)),
-            ("Disk", f"{du.used / 2**30:.1f}/{du.total / 2**30:.0f}GB", disk_pct, level(disk_pct, 80, 90)),
+            ("CPU", f"{cpu:3.0f}% {st.mhz or cpu_mhz()}MHz {temp:.0f}°C", cpu,
+             worst(level(cpu, *use), level(temp, c["temp_warn"], c["temp_bad"]))),
+            ("RAM", f"{ram_pct:3.0f}% {used}/{total}MB", ram_pct, level(ram_pct, *use)),
+            ("Disk", f"{disk_pct:3.0f}% {du.used / 2**30:.1f}/{du.total / 2**30:.0f}GB", disk_pct,
+             level(disk_pct, *use)),
         ]:
             d.text((10, y), label, font=self.font, fill=DIM)
-            self.bar(d, 90, y + 5, 150, pct, color)
-            d.text((252, y), text, font=self.small if label == "CPU" else self.font, fill=FG)
-            y += 22
+            self.bar(d, 90, y + 5, 140, pct, color)
+            d.text((240, y), text, font=self.font, fill=FG)
+            y += 24
 
     def chart(self, d, top, height, title, series, vmin, vmax, marks=()):
         """Draws one history chart. series: [(values, color)], marks: [(value, color)]."""
@@ -384,18 +510,20 @@ class UI:
             return
         cpu, temp, rx, tx = st.cpu[-1], st.temp[-1], st.rx[-1], st.tx[-1]
         self.chart(d, 40, 76, f"CPU {cpu:3.0f}%  {st.mhz}MHz  max {max(st.cpu):.0f}%",
-                   [(st.cpu, ACCENT)], 0, 100)
+                   [(st.cpu, ACCENT)], 0, 100,
+                   marks=[(self.cfg["use_bad"], BAD), (self.cfg["use_warn"], WARN)])
+        tw, tb = self.cfg["temp_warn"], self.cfg["temp_bad"]
         lo = min(min(st.temp), 40)
-        hi = max(max(st.temp), 70)
-        self.chart(d, 120, 76, f"Temp {temp:.1f}°C  max {max(st.temp):.1f}°C  limit 70",
-                   [(st.temp, level(temp, 65, 75))], lo, hi, marks=[(70, BAD), (60, WARN)])
+        hi = max(max(st.temp), tb + 5)
+        self.chart(d, 120, 76, f"Temp {temp:.1f}°C  max {max(st.temp):.1f}°C",
+                   [(st.temp, level(temp, tw, tb))], lo, hi, marks=[(tb, BAD), (tw, WARN)])
         net_max = max(max(st.rx), max(st.tx), 16)
         self.chart(d, 200, 78, f"Net \u2193{rx:6.1f} \u2191{tx:6.1f} KB/s",
                    [(st.rx, OK), (st.tx, WARN)], 0, net_max)
 
     def page_docker(self, d):
         self.header(d, "Docker")
-        cs = containers()
+        cs = cached(10, containers)
         if not cs:
             d.text((10, 50), "no containers", font=self.font, fill=DIM)
             return
@@ -412,7 +540,7 @@ class UI:
         d.line([x, y - r, x, y + r], fill=color, width=2)
         d.ellipse([x - 4, y - 4, x + 4, y + 4], outline=color)
 
-    def page_touch(self, d):
+    def page_settings(self, d):
         if self.cal_step is not None:
             tx, ty = CAL_TARGETS[self.cal_step]
             d.text((W // 2, 110), f"Calibration {self.cal_step + 1}/{len(CAL_TARGETS)}",
@@ -420,14 +548,30 @@ class UI:
             d.text((W // 2, 140), "press the center of the cross", font=self.font, fill=FG, anchor="mm")
             self.crosshair(d, tx, ty, WARN, r=20)
             return
+        if self.touch_test:
+            self.page_touch_test(d)
+            return
+        self.header(d, "Settings")
+        for i, (key, (label, _, _, fmt)) in enumerate(SETTINGS.items()):
+            y = SET_Y + i * SET_ROW
+            d.text((10, y + 15), label, font=self.font, fill=FG, anchor="lm")
+            for bx, sym in ((250, "<"), (426, ">")):
+                d.rectangle([bx, y, bx + 44, y + 30], outline=ACCENT, width=2)
+                d.text((bx + 22, y + 15), sym, font=self.bold, fill=ACCENT, anchor="mm")
+            d.text((360, y + 15), fmt(self.cfg[key]), font=self.font, fill=FG, anchor="mm")
+            if key == "theme":
+                d.rectangle([200, y + 4, 222, y + 26], fill=THEMES[self.cfg[key]][1], outline=DIM)
+        for name, label in (("calibrate", "Calibrate touch"), ("test", "Touch test")):
+            box = SET_BUTTONS[name]
+            d.rectangle(box, outline=ACCENT, width=2)
+            d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), label,
+                   font=self.font, fill=ACCENT, anchor="mm")
+
+    def page_touch_test(self, d):
         self.header(d, "Touch test")
-        box = CAL_BUTTON
-        d.rectangle(box, outline=ACCENT, width=2)
-        d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), "Calibrate",
-               font=self.font, fill=ACCENT, anchor="mm")
-        d.text((10, 50), "tap anywhere", font=self.font, fill=DIM)
+        d.text((10, 44), "tap anywhere, a tab to exit", font=self.small, fill=DIM)
         if self.cal_msg:
-            d.text((10, 74), self.cal_msg, font=self.small, fill=OK)
+            d.text((10, 64), self.cal_msg, font=self.small, fill=OK)
         for i, (x, y) in enumerate(self.taps):
             last = i == len(self.taps) - 1
             self.crosshair(d, x, y, WARN if last else DIM)
@@ -436,10 +580,11 @@ class UI:
             d.text((10, H - TAB_H - 26), f"x={x:3d}  y={y:3d}", font=self.bold, fill=WARN)
 
     def render(self):
-        img = Image.new("RGB", (W, H), BG)
+        self.bg = THEMES[self.cfg["theme"]][1]
+        img = Image.new("RGB", (W, H), self.bg)
         d = ImageDraw.Draw(img)
         with self.lock:
-            [self.page_status, self.page_graphs, self.page_docker, self.page_touch][self.page](d)
+            [self.page_status, self.page_graphs, self.page_docker, self.page_settings][self.page](d)
             if self.cal_step is None:
                 self.draw_tabs(d)
         return img
@@ -462,7 +607,7 @@ def main():
         with open(OUT + ".tmp", "wb") as f:
             f.write(data)
         os.replace(OUT + ".tmp", OUT)
-        ui.wake.wait(5)
+        ui.wake.wait(ui.cfg["refresh"])
         ui.wake.clear()
 
 

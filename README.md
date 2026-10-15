@@ -55,11 +55,14 @@ init sequences and frame formats), 32-bit OS.
 - Touchscreen: X/Y/pressure, exposed as a standard input device
   (`KeDei Touch`, via `uinput`), works with a finger or the stylus.
 - Two modes:
-  - **ui** – lightweight touch UI with tabs: system status (IP, Wi-Fi, CPU
-    load/clock/temperature, RAM, disk, power with the throttling cause:
-    under-voltage or temperature limit), 30-minute graphs of CPU,
-    temperature and network traffic, Docker containers, touch test and
-    on-screen calibration.
+  - **ui** – lightweight touch UI with tabs:
+    - *Status*: local and external IP, ping, Wi-Fi signal, uptime/load,
+      power with the throttling cause (under-voltage or temperature limit),
+      Docker, CPU load/clock/temperature, RAM and disk usage;
+    - *Graphs*: last 30 minutes of CPU, temperature and network traffic;
+    - *Docker*: containers and their state;
+    - *Settings*: background color, refresh interval, warning thresholds,
+      touch calibration and touch test (saved to `/etc/kedei-ui.conf`).
   - **desktop** – full display: the console and an X11 desktop are rendered
     into the system framebuffer and mirrored to the LCD; the touchscreen
     clicks and drags like a mouse.
@@ -93,7 +96,7 @@ everything with `sudo ./install.sh uninstall`.
 
 ## Touch calibration
 
-In **ui** mode open the *Touch* tab and press *Calibrate*, then tap the
+In **ui** mode open the *Settings* tab and press *Calibrate touch*, then tap the
 center of each of the 5 crosses. The result is saved to
 `/etc/kedei-touch.conf` and applied immediately.
 
