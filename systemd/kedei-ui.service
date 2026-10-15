@@ -1,0 +1,12 @@
+[Unit]
+Description=Touch UI for the KeDei LCD
+After=kedei-lcd.service network-online.target
+Wants=kedei-lcd.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/kedei-ui
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

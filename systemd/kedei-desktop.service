@@ -1,0 +1,14 @@
+[Unit]
+Description=X11 desktop on the KeDei LCD
+After=kedei-lcd.service systemd-user-sessions.service
+
+[Service]
+User=@USER@
+PAMName=login
+TTYPath=/dev/tty7
+StandardInput=tty
+ExecStart=/usr/bin/startx -- :0 vt7 -nolisten tcp
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

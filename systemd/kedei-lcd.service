@@ -1,0 +1,12 @@
+[Unit]
+Description=KeDei 3.5" SPI LCD driver
+After=local-fs.target
+
+[Service]
+ExecStartPre=/bin/mkdir -p /run/kedei
+ExecStart=/usr/local/bin/kedei-lcd daemon /run/kedei/fb.raw
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

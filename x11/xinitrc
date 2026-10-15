@@ -1,0 +1,6 @@
+# Default session for the KeDei desktop mode (installed as ~/.xinitrc
+# unless one already exists).
+xset s off -dpms
+tint2 &
+pcmanfm --desktop &
+exec openbox-session
