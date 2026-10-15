@@ -63,6 +63,12 @@ init sequences and frame formats), 32-bit OS.
     clicks and drags like a mouse.
 - No kernel module, no DKMS: survives kernel upgrades.
 
+<p align="center">
+  <img src="docs/img/kedei-ui-status.png" width="480"
+       alt="kedei-ui status page: IP, Wi-Fi, uptime, power, Docker, CPU, RAM and disk">
+  <br><em>kedei-ui status page, captured from the frame sent to the LCD</em>
+</p>
+
 Video playback is not realistic: the board needs a separate 32-bit SPI frame
 for every pixel, which limits a full-screen refresh to ~3 frames/s.
 
