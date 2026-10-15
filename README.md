@@ -24,6 +24,14 @@ and carries three `74HC595` chips, an `HR2046` touch controller and an
 `AMS1117` regulator. The header only has the SPI pins populated
 (`L_CS T_CS IRQ GND / GND CLK MISO MOSI`, plus 5V).
 
+<p align="center">
+  <img src="docs/img/kedei-v6.3-back.jpg" width="420"
+       alt="Back of the KeDei 3.5 inch SPI TFTLCD board, version 6.3 2018/4/9">
+</p>
+
+Boards marked `version 6.3 2016/11/1` look identical and probably work too,
+but have not been tested.
+
 ## Tested hardware
 
 Everything in this repository was tested on exactly this setup:
