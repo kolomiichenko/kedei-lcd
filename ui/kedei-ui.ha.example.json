@@ -1,0 +1,15 @@
+{
+  "url": "http://localhost:8123",
+  "token_file": "/etc/kedei-ui.ha-token",
+  "tiles": [
+    {"entity": "weather.forecast_home", "name": "Weather"},
+    {"entity": "binary_sensor.front_door", "name": "Front door"},
+    {"entity": "alarm_control_panel.home", "name": "Alarm"},
+    {"entity": "sensor.living_room_temperature", "name": "Living"},
+    {"entity": "light.living_room", "name": "Living", "tap": true},
+    {"entity": "light.bedroom", "name": "Bedroom", "tap": true},
+    {"entity": "switch.coffee_maker", "name": "Coffee", "tap": true},
+    {"entity": "vacuum.robot", "name": "Vacuum", "tap": true, "sub": "sensor.robot_battery"},
+    {"name": "All lights", "service": "light.turn_off", "target": "all"}
+  ]
+}

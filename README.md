@@ -60,7 +60,11 @@ init sequences and frame formats), 32-bit OS.
       power with the throttling cause (under-voltage or temperature limit),
       Docker, CPU load/clock/temperature, RAM and disk usage;
     - *Graphs*: last 30 minutes of CPU, temperature and network traffic;
-    - *Docker*: containers with start/stop buttons (tap twice to confirm);
+    - *Home* (optional): Home Assistant tiles – states of lights, sensors,
+      appliances, tap to toggle lights/switches or start a vacuum, see
+      [Home Assistant page](#home-assistant-page);
+    - *Docker* (when Docker is installed): containers with start/stop
+      buttons (tap twice to confirm);
     - *Settings*: background color, refresh interval, night mode (dimmed
       colors on a schedule), screen off after inactivity, PIN lock with an
       on-screen keypad, warning thresholds, touch calibration and touch test
@@ -109,6 +113,36 @@ screen X axis. The values from the tested board:
 ```
 195 3983 3923 206 1
 ```
+
+## Home Assistant page
+
+The *Home* tab appears only when `/etc/kedei-ui.ha.json` exists. It shows up to
+16 tiles (4 × 4) polled from the Home Assistant REST API every 3 s while the
+tab is open.
+
+1. In Home Assistant open your profile → *Security* → *Long-lived access
+   tokens* and create one.
+2. Save it on the Pi without putting it in the shell history:
+
+   ```sh
+   sudo sh -c 'umask 077; cat > /etc/kedei-ui.ha-token'   # paste, Enter, Ctrl-D
+   ```
+
+3. Copy [`ui/kedei-ui.ha.example.json`](ui/kedei-ui.ha.example.json) to
+   `/etc/kedei-ui.ha.json`, put your entity ids in and run
+   `sudo systemctl restart kedei-ui`.
+
+Tile options:
+
+| Key | Meaning |
+|---|---|
+| `entity` | entity id whose state is shown |
+| `name` | label (default: the friendly name) |
+| `tap` | `true` makes the tile a button: toggles `light`/`switch`/`fan`/`input_boolean`/`automation`, runs a `scene`/`script`, starts a `vacuum` or sends it home |
+| `sub` | second entity shown small in the corner, e.g. a battery or power sensor |
+| `service`, `target` | button without an entity, e.g. `"service": "light.turn_off", "target": "all"` |
+
+The PIN lock also covers this tab.
 
 ## How it works
 

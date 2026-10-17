@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""kedei-ui: touch UI for the KeDei LCD (status / graphs / docker / settings pages).
+"""kedei-ui: touch UI for the KeDei LCD (status / graphs / home / docker / settings pages).
 
 Renders a 480x320 RGB565 frame that the kedei-lcd daemon puts on the screen
 and reads taps from the "KeDei Touch" input device."""
 
+import calendar
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ TOUCH_STATE = "/run/kedei/touch"
 CAL_PATH = "/etc/kedei-touch.conf"
 SETTINGS_PATH = "/etc/kedei-ui.conf"
 PIN_PATH = "/etc/kedei-ui.pin"
+HA_PATH = "/etc/kedei-ui.ha.json"
 W, H = 480, 320
 TAB_H = 36
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -38,7 +40,8 @@ WARN = (255, 190, 0)
 BAD = (255, 70, 70)
 TAB_BG = (30, 30, 40)
 
-PAGES = ["Status", "Graphs", "Docker", "Settings"]
+# Home is shown only when HA_PATH is configured, Docker only when docker is installed.
+PAGES = ["Status", "Graphs", "Home", "Docker", "Settings"]
 # Calibration targets: inset corners, then the center for verification.
 CAL_TARGETS = [(30, 30), (450, 30), (450, 290), (30, 290), (240, 160)]
 
@@ -77,6 +80,9 @@ KP_X, KP_Y, KP_W, KP_H = 90, 82, 100, 58
 DOCKER_Y, DOCKER_ROW = 44, 40
 DOCKER_BUTTON_X = W - 110
 CONFIRM_S = 3  # a second tap within this time confirms start/stop
+# Home Assistant page: 4 x 4 grid of tiles.
+HA_COLS, HA_ROWS = 4, 4
+HA_Y, HA_GAP = 42, 4
 
 EV_KEY, EV_ABS, BTN_TOUCH, ABS_X, ABS_Y = 1, 3, 0x14A, 0, 1
 
@@ -321,6 +327,131 @@ def worst(*colors):
 
 # --- touch input -------------------------------------------------------------
 
+class HomeAssistant(threading.Thread):
+    """Polls entity states from the Home Assistant REST API and calls services.
+
+    Configured by HA_PATH:
+      {"url": "http://localhost:8123", "token_file": "/etc/kedei-ui.ha-token",
+       "tiles": [{"entity": "light.kitchen", "name": "Kitchen", "tap": true,
+                  "sub": "sensor.kitchen_temperature"},
+                 {"name": "All off", "service": "light.turn_off", "target": "all"}]}
+    """
+
+    FAST, SLOW = 3, 30  # poll period with the page open / hidden, seconds
+    TOGGLE = ("light", "switch", "input_boolean", "fan", "automation")
+
+    def __init__(self, on_update):
+        super().__init__(daemon=True)
+        self.on_update = on_update
+        self.visible = False
+        self.states = {}
+        self.error = None
+        self.poke = threading.Event()
+        try:
+            with open(HA_PATH) as f:
+                cfg = json.load(f)
+            self.url = cfg.get("url", "http://localhost:8123").rstrip("/")
+            self.token = read(cfg.get("token_file", "/etc/kedei-ui.ha-token"))
+            self.tiles = cfg.get("tiles", [])[: HA_COLS * HA_ROWS]
+        except (OSError, ValueError) as e:
+            self.url, self.token, self.tiles = "", "", []
+            self.error = f"no config: {HA_PATH}" if isinstance(e, OSError) else "bad config"
+
+    def request(self, path, body=None):
+        req = urllib.request.Request(self.url + path, method="POST" if body is not None else "GET",
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": "Bearer " + self.token,
+                                              "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)
+
+    def run(self):
+        if not self.tiles:
+            return
+        while True:
+            try:
+                self.states = {e["entity_id"]: e for e in self.request("/api/states")}
+                self.error = None
+            except Exception as e:
+                self.error = str(getattr(e, "reason", e))[:40]
+            self.on_update()
+            self.poke.wait(self.FAST if self.visible else self.SLOW)
+            self.poke.clear()
+
+    def action(self, tile):
+        """Service call for a tapped tile, or None when the tile is read-only."""
+        if "service" in tile:
+            domain, service = tile["service"].split(".", 1)
+            return domain, service, {"entity_id": tile.get("target", tile.get("entity"))}
+        entity = tile.get("entity", "")
+        domain = entity.split(".")[0]
+        if not tile.get("tap"):
+            return None
+        if domain in self.TOGGLE:
+            return "homeassistant", "toggle", {"entity_id": entity}
+        if domain in ("scene", "script"):
+            return domain, "turn_on", {"entity_id": entity}
+        if domain == "vacuum":
+            busy = self.state(entity) in ("cleaning", "returning")
+            return "vacuum", "return_to_base" if busy else "start", {"entity_id": entity}
+        return None
+
+    def call(self, tile):
+        act = self.action(tile)
+        if not act:
+            return False
+
+        def run():
+            try:
+                self.request(f"/api/services/{act[0]}/{act[1]}", act[2])
+            except Exception as e:
+                self.error = str(getattr(e, "reason", e))[:40]
+            time.sleep(0.5)  # let the state settle before re-reading it
+            self.poke.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def state(self, entity):
+        return self.states.get(entity, {}).get("state", "")
+
+    def text(self, entity):
+        """Short human readable state of an entity."""
+        e = self.states.get(entity)
+        if not e:
+            return "?"
+        st, attr = e["state"], e.get("attributes", {})
+        if st in ("unavailable", "unknown"):
+            return "n/a"
+        domain = entity.split(".")[0]
+        if domain == "weather":
+            t = attr.get("temperature")
+            return f"{round(t) if isinstance(t, (int, float)) else '?'}° {st.replace('partlycloudy', 'cloudy')}"
+        if domain == "binary_sensor" and attr.get("device_class") in ("door", "window", "opening"):
+            return "open" if st == "on" else "closed"
+        if domain == "light" and st == "on" and attr.get("brightness"):
+            return f"on {round(attr['brightness'] * 100 / 255)}%"
+        if domain == "alarm_control_panel":
+            return st.replace("armed_", "").replace("_", " ")
+        if re.fullmatch(r"\d{4}-\d\d-\d\dT[\d:.]+(\+00:00|Z)?", st):
+            # Timestamp sensors, e.g. "program finishes at".
+            try:
+                t = calendar.timegm(time.strptime(st[:19], "%Y-%m-%dT%H:%M:%S"))
+                return time.strftime("%H:%M", time.localtime(t))
+            except ValueError:
+                return st[:10]
+        try:
+            v = float(st)
+            unit = attr.get("unit_of_measurement", "")
+            return f"{v:.0f}{unit}" if abs(v) >= 10 or v == int(v) else f"{v:.1f}{unit}"
+        except ValueError:
+            return st.replace("_", " ")
+
+    def active(self, entity):
+        st = self.state(entity)
+        return st in ("on", "open", "cleaning", "playing", "run", "heating") or st.startswith("armed")
+
+
 def find_touch_device():
     for block in read("/proc/bus/input/devices").split("\n\n"):
         if 'Name="KeDei Touch"' in block:
@@ -430,6 +561,11 @@ class UI:
         self.lock = threading.Lock()
         self.stats = Sampler()
         self.stats.start()
+        self.ha = HomeAssistant(self.wake.set)
+        self.ha.start()
+        self.ha_pressed = None  # (tile index, until) for the tap highlight
+        self.pages = [p for p in PAGES
+                      if (p != "Home" or self.ha.tiles) and (p != "Docker" or shutil.which("docker"))]
 
     # Tap handling runs on the touch thread.
     def on_tap(self, x, y):
@@ -442,14 +578,19 @@ class UI:
             elif self.pin_mode:
                 self.pin_tap(x, y)
             elif y >= H - TAB_H:
-                self.page = min(x * len(PAGES) // W, len(PAGES) - 1)
+                self.page = min(x * len(self.pages) // W, len(self.pages) - 1)
                 self.touch_test = False
             elif self.touch_test:
                 self.taps = (self.taps + [(x, y)])[-8:]
-            elif PAGES[self.page] == "Settings":
+            elif self.pages[self.page] == "Settings":
                 self.settings_tap(x, y)
-            elif PAGES[self.page] == "Docker":
+            elif self.pages[self.page] == "Docker":
                 self.docker_tap(x, y)
+            elif self.pages[self.page] == "Home":
+                self.ha_tap(x, y)
+            self.ha.visible = self.pages[self.page] == "Home"
+            if self.ha.visible:
+                self.ha.poke.set()
         self.wake.set()
 
     def docker_tap(self, x, y):
@@ -474,6 +615,20 @@ class UI:
             self.wake.set()
 
         threading.Thread(target=run, daemon=True).start()
+
+    def ha_cell(self, i):
+        tw = (W - 10 - HA_GAP * (HA_COLS - 1)) // HA_COLS
+        th = (H - TAB_H - HA_Y - 4 - HA_GAP * (HA_ROWS - 1)) // HA_ROWS
+        x, y = 5 + (i % HA_COLS) * (tw + HA_GAP), HA_Y + (i // HA_COLS) * (th + HA_GAP)
+        return [x, y, x + tw, y + th]
+
+    def ha_tap(self, x, y):
+        for i, tile in enumerate(self.ha.tiles):
+            x0, y0, x1, y1 = self.ha_cell(i)
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                if self.ha.call(tile):
+                    self.ha_pressed = (i, time.monotonic() + 1.5)
+                return
 
     def settings_keys(self):
         return [k for k, v in SETTINGS.items() if v[4] == self.set_page]
@@ -572,8 +727,8 @@ class UI:
         self.wake.set()
 
     def draw_tabs(self, d):
-        tw = W // len(PAGES)
-        for i, name in enumerate(PAGES):
+        tw = W // len(self.pages)
+        for i, name in enumerate(self.pages):
             x0 = i * tw
             active = i == self.page
             d.rectangle([x0, H - TAB_H, x0 + tw - 1, H - 1], fill=ACCENT if active else TAB_BG)
@@ -718,6 +873,37 @@ class UI:
                 d.text(center, "Stop" if running else "Start", font=self.font, fill=color, anchor="mm")
             y += DOCKER_ROW
 
+    def page_home(self, d):
+        self.header(d, "Home")
+        ha = self.ha
+        if not ha.tiles or (ha.error and not ha.states):
+            d.text((10, 50), ha.error or "connecting...", font=self.font, fill=DIM)
+            return
+        if ha.error:
+            d.text((110, 12), "offline", font=self.small, fill=BAD)
+        pressed = self.ha_pressed[0] if self.ha_pressed and time.monotonic() < self.ha_pressed[1] else None
+        for i, tile in enumerate(ha.tiles):
+            box = self.ha_cell(i)
+            entity = tile.get("entity", "")
+            on = bool(entity) and ha.active(entity)
+            na = bool(entity) and ha.text(entity) == "n/a"
+            tappable = ha.action(tile) is not None
+            if i == pressed:
+                d.rectangle(box, fill=WARN)
+            elif on:
+                d.rectangle(box, fill=(0, 70, 90), outline=ACCENT, width=2)
+            else:
+                d.rectangle(box, fill=TAB_BG, outline=ACCENT if tappable else TAB_BG)
+            fg = self.bg if i == pressed else DIM if na else FG
+            name = tile.get("name") or ha.states.get(entity, {}).get("attributes", {}).get("friendly_name", entity)
+            d.text((box[0] + 6, box[1] + 4), name[:11], font=self.small,
+                   fill=self.bg if i == pressed else DIM)
+            value = ha.text(entity) if entity else "tap"
+            d.text((box[0] + 6, box[1] + 22), value[:10], font=self.font, fill=fg)
+            if tile.get("sub"):
+                d.text((box[2] - 5, box[1] + 5), ha.text(tile["sub"])[:6], font=self.small,
+                       fill=fg, anchor="ra")
+
     def crosshair(self, d, x, y, color, r=12):
         d.line([x - r, y, x + r, y], fill=color, width=2)
         d.line([x, y - r, x, y + r], fill=color, width=2)
@@ -800,7 +986,7 @@ class UI:
             if self.pin_mode:
                 self.page_pin(d)
             else:
-                [self.page_status, self.page_graphs, self.page_docker, self.page_settings][self.page](d)
+                getattr(self, "page_" + self.pages[self.page].lower())(d)
                 if self.cal_step is None:
                     self.draw_tabs(d)
         if night_active(self.cfg):
