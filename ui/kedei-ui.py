@@ -338,7 +338,7 @@ class HomeAssistant(threading.Thread):
     """
 
     FAST, SLOW = 3, 30  # poll period with the page open / hidden, seconds
-    TOGGLE = ("light", "switch", "input_boolean", "fan", "automation")
+    TOGGLE = ("light", "switch", "input_boolean", "fan", "humidifier", "automation")
 
     def __init__(self, on_update):
         super().__init__(daemon=True)

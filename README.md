@@ -138,7 +138,7 @@ Tile options:
 |---|---|
 | `entity` | entity id whose state is shown |
 | `name` | label (default: the friendly name) |
-| `tap` | `true` makes the tile a button: toggles `light`/`switch`/`fan`/`input_boolean`/`automation`, runs a `scene`/`script`, starts a `vacuum` or sends it home |
+| `tap` | `true` makes the tile a button: toggles `light`/`switch`/`fan`/`humidifier`/`input_boolean`/`automation`, runs a `scene`/`script`, starts a `vacuum` or sends it home |
 | `sub` | second entity shown small in the corner, e.g. a battery or power sensor |
 | `service`, `target` | button without an entity, e.g. `"service": "light.turn_off", "target": "all"` |
 
