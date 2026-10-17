@@ -60,7 +60,7 @@ init sequences and frame formats), 32-bit OS.
       power with the throttling cause (under-voltage or temperature limit),
       Docker, CPU load/clock/temperature, RAM and disk usage;
     - *Graphs*: last 30 minutes of CPU, temperature and network traffic;
-    - *Home* (optional): Home Assistant tiles – states of lights, sensors,
+    - *HA* (optional): Home Assistant tiles – states of lights, sensors,
       appliances, tap to toggle lights/switches or start a vacuum, see
       [Home Assistant page](#home-assistant-page);
     - *Docker* (when Docker is installed): containers with start/stop
@@ -116,7 +116,7 @@ screen X axis. The values from the tested board:
 
 ## Home Assistant page
 
-The *Home* tab appears only when `/etc/kedei-ui.ha.json` exists. It shows up to
+The *HA* tab appears only when `/etc/kedei-ui.ha.json` exists. It shows up to
 16 tiles (4 × 4) polled from the Home Assistant REST API every 3 s while the
 tab is open.
 
@@ -143,6 +143,21 @@ Tile options:
 | `service`, `target` | button without an entity, e.g. `"service": "light.turn_off", "target": "all"` |
 
 The PIN lock also covers this tab.
+
+## HTTP API
+
+`kedei-ui` listens on `127.0.0.1:8091` (change with `KEDEI_UI_API_PORT`):
+
+| Request | Does |
+|---|---|
+| `GET /state` | CPU, temperature, memory, disk, power, current page, all settings with their options |
+| `POST /settings` `{"night": "On", "sleep": 5}` | change settings (value or the label shown on the screen); the PIN lock is read-only |
+| `POST /page` `{"page": "Graphs"}` | switch the page and wake the screen up |
+| `POST /wake` | wake the screen up |
+
+[`docs/home-assistant.yaml`](docs/home-assistant.yaml) turns it into Home Assistant
+entities (screen settings as selects, Pi status as sensors) when Home Assistant
+runs on the same Pi with host networking.
 
 ## How it works
 

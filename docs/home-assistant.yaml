@@ -1,0 +1,195 @@
+# kedei-ui screen settings and Raspberry Pi status in Home Assistant.
+#
+# Needs Home Assistant on the same Pi with host networking (the API listens on
+# 127.0.0.1:8091). Copy to /config/packages/kedei.yaml and enable packages in
+# configuration.yaml:
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+
+rest:
+  - resource: http://127.0.0.1:8091/state
+    scan_interval: 15
+    sensor:
+      - name: Pi Screen
+        unique_id: kedei_screen
+        icon: mdi:monitor
+        value_template: "{{ value_json.page }}"
+        json_attributes: [pages, settings, sleeping, night]
+      - name: Pi CPU Temperature
+        unique_id: kedei_cpu_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        value_template: "{{ value_json.temperature }}"
+      - name: Pi CPU Load
+        unique_id: kedei_cpu_load
+        icon: mdi:cpu-64-bit
+        state_class: measurement
+        unit_of_measurement: "%"
+        value_template: "{{ value_json.cpu }}"
+      - name: Pi Memory
+        unique_id: kedei_memory
+        icon: mdi:memory
+        state_class: measurement
+        unit_of_measurement: "%"
+        value_template: "{{ value_json.memory }}"
+      - name: Pi Disk
+        unique_id: kedei_disk
+        icon: mdi:harddisk
+        state_class: measurement
+        unit_of_measurement: "%"
+        value_template: "{{ value_json.disk }}"
+      - name: Pi Power
+        unique_id: kedei_power
+        icon: mdi:flash
+        value_template: "{{ value_json.power }}"
+
+rest_command:
+  kedei_ui:
+    url: "http://127.0.0.1:8091/{{ path }}"
+    method: POST
+    content_type: application/json
+    payload: "{{ body | tojson }}"
+
+template:
+  - button:
+      - name: Pi Screen Wake
+        unique_id: kedei_wake
+        icon: mdi:gesture-tap
+        press:
+          - action: rest_command.kedei_ui
+            data: {path: wake, body: {}}
+    select:
+      - name: Pi Screen Page
+        unique_id: kedei_page
+        icon: mdi:tab
+        availability: "{{ state_attr('sensor.pi_screen', 'pages') is not none }}"
+        options: "{{ state_attr('sensor.pi_screen', 'pages') or [] }}"
+        state: "{{ states('sensor.pi_screen') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: page, body: {page: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Background
+        unique_id: kedei_theme
+        icon: mdi:palette
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('theme', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('theme', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {theme: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Refresh
+        unique_id: kedei_refresh
+        icon: mdi:refresh
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('refresh', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('refresh', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {refresh: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Night Mode
+        unique_id: kedei_night
+        icon: mdi:weather-night
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {night: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Night From
+        unique_id: kedei_night_from
+        icon: mdi:clock-start
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_from', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_from', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {night_from: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Night Until
+        unique_id: kedei_night_to
+        icon: mdi:clock-end
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_to', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_to', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {night_to: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Screen Off
+        unique_id: kedei_sleep
+        icon: mdi:monitor-off
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('sleep', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('sleep', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {sleep: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Night Brightness
+        unique_id: kedei_night_dim
+        icon: mdi:brightness-4
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_dim', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('night_dim', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {night_dim: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Temp Warning
+        unique_id: kedei_temp_warn
+        icon: mdi:thermometer
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('temp_warn', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('temp_warn', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {temp_warn: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Temp Alert
+        unique_id: kedei_temp_bad
+        icon: mdi:thermometer-alert
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('temp_bad', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('temp_bad', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {temp_bad: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Usage Warning
+        unique_id: kedei_use_warn
+        icon: mdi:gauge
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('use_warn', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('use_warn', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {use_warn: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}
+      - name: Pi Screen Usage Alert
+        unique_id: kedei_use_bad
+        icon: mdi:gauge-full
+        availability: "{{ state_attr('sensor.pi_screen', 'settings') is not none }}"
+        options: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('use_bad', {}).get('options', []) }}"
+        state: "{{ (state_attr('sensor.pi_screen', 'settings') or {}).get('use_bad', {}).get('text') }}"
+        select_option:
+          - action: rest_command.kedei_ui
+            data: {path: settings, body: {use_bad: "{{ option }}"}}
+          - action: homeassistant.update_entity
+            target: {entity_id: sensor.pi_screen}

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""kedei-ui: touch UI for the KeDei LCD (status / graphs / home / docker / settings pages).
+"""kedei-ui: touch UI for the KeDei LCD (status / graphs / HA / docker / settings pages).
 
 Renders a 480x320 RGB565 frame that the kedei-lcd daemon puts on the screen
 and reads taps from the "KeDei Touch" input device."""
 
 import calendar
 import hashlib
+import http.server
 import json
 import os
 import re
@@ -27,6 +28,9 @@ CAL_PATH = "/etc/kedei-touch.conf"
 SETTINGS_PATH = "/etc/kedei-ui.conf"
 PIN_PATH = "/etc/kedei-ui.pin"
 HA_PATH = "/etc/kedei-ui.ha.json"
+# Local HTTP API (settings, current page, status); localhost only.
+API_ADDR = ("127.0.0.1", int(os.environ.get("KEDEI_UI_API_PORT", "8091")))
+API_READONLY = ("lock",)  # the PIN lock can only be changed on the screen
 W, H = 480, 320
 TAB_H = 36
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -40,8 +44,8 @@ WARN = (255, 190, 0)
 BAD = (255, 70, 70)
 TAB_BG = (30, 30, 40)
 
-# Home is shown only when HA_PATH is configured, Docker only when docker is installed.
-PAGES = ["Status", "Graphs", "Home", "Docker", "Settings"]
+# HA is shown only when HA_PATH is configured, Docker only when docker is installed.
+PAGES = ["Status", "Graphs", "HA", "Docker", "Settings"]
 # Calibration targets: inset corners, then the center for verification.
 CAL_TARGETS = [(30, 30), (450, 30), (450, 290), (30, 290), (240, 160)]
 
@@ -565,7 +569,7 @@ class UI:
         self.ha.start()
         self.ha_pressed = None  # (tile index, until) for the tap highlight
         self.pages = [p for p in PAGES
-                      if (p != "Home" or self.ha.tiles) and (p != "Docker" or shutil.which("docker"))]
+                      if (p != "HA" or self.ha.tiles) and (p != "Docker" or shutil.which("docker"))]
 
     # Tap handling runs on the touch thread.
     def on_tap(self, x, y):
@@ -586,9 +590,9 @@ class UI:
                 self.settings_tap(x, y)
             elif self.pages[self.page] == "Docker":
                 self.docker_tap(x, y)
-            elif self.pages[self.page] == "Home":
+            elif self.pages[self.page] == "HA":
                 self.ha_tap(x, y)
-            self.ha.visible = self.pages[self.page] == "Home"
+            self.ha.visible = self.pages[self.page] == "HA"
             if self.ha.visible:
                 self.ha.poke.set()
         self.wake.set()
@@ -615,6 +619,40 @@ class UI:
             self.wake.set()
 
         threading.Thread(target=run, daemon=True).start()
+
+    def api_state(self):
+        used, total = mem()
+        disk = shutil.disk_usage("/")
+        settings = {}
+        for key, (label, choices, _, fmt, _) in SETTINGS.items():
+            settings[key] = {"label": label, "value": self.cfg[key], "text": fmt(self.cfg[key]),
+                             "options": [fmt(c) for c in choices],
+                             "readonly": key in API_READONLY}
+        return {
+            "page": self.pages[self.page] if not self.pin_mode else "PIN",
+            "pages": self.pages,
+            "sleeping": self.sleeping,
+            "night": night_active(self.cfg),
+            "cpu": round(self.stats.cpu[-1], 1) if self.stats.cpu else None,
+            "temperature": temperature(),
+            "mhz": self.stats.mhz,
+            "memory": round(100 * used / total, 1),
+            "disk": round(100 * disk.used / disk.total, 1),
+            "power": power_status(throttled())[0],
+            "settings": settings,
+        }
+
+    def api_settings(self, body):
+        for key, value in body.items():
+            if key not in SETTINGS or key in API_READONLY:
+                return f"unknown or read-only setting: {key}"
+            choices, fmt = SETTINGS[key][1], SETTINGS[key][3]
+            match = [c for c in choices if value == c or str(value) in (str(c), fmt(c))]
+            if not match:
+                return f"{key}: one of " + ", ".join(fmt(c) for c in choices)
+            self.cfg[key] = match[0]
+        save_settings(self.cfg)
+        return None
 
     def ha_cell(self, i):
         tw = (W - 10 - HA_GAP * (HA_COLS - 1)) // HA_COLS
@@ -873,8 +911,8 @@ class UI:
                 d.text(center, "Stop" if running else "Start", font=self.font, fill=color, anchor="mm")
             y += DOCKER_ROW
 
-    def page_home(self, d):
-        self.header(d, "Home")
+    def page_ha(self, d):
+        self.header(d, "Home Assistant")
         ha = self.ha
         if not ha.tiles or (ha.error and not ha.states):
             d.text((10, 50), ha.error or "connecting...", font=self.font, fill=DIM)
@@ -1003,9 +1041,71 @@ def to_rgb565(img):
     return Image.merge("LA", (lo, hi)).tobytes()
 
 
+class Api(http.server.BaseHTTPRequestHandler):
+    """Small JSON API for Home Assistant and scripts.
+
+    GET  /state                  status, current page and all settings
+    POST /settings {"key": val}  change settings (value or its label)
+    POST /page {"page": "HA"}    switch the page and wake the screen up
+    POST /wake                   wake the screen up
+    """
+
+    ui = None
+
+    def log_message(self, *args):
+        pass
+
+    def reply(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path != "/state":
+            return self.reply(404, {"error": "not found"})
+        self.reply(200, self.ui.api_state())
+
+    def do_POST(self):
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        except ValueError:
+            return self.reply(400, {"error": "bad json"})
+        ui = self.ui
+        with ui.lock:
+            if self.path == "/settings":
+                err = ui.api_settings(body)
+                if err:
+                    return self.reply(400, {"error": err})
+            elif self.path == "/page":
+                if body.get("page") not in ui.pages:
+                    return self.reply(400, {"error": "pages: " + ", ".join(ui.pages)})
+                ui.page, ui.touch_test = ui.pages.index(body["page"]), False
+                ui.ha.visible = body["page"] == "HA"
+                ui.sleeping, ui.last_touch = False, time.monotonic()
+            elif self.path == "/wake":
+                ui.sleeping, ui.last_touch = False, time.monotonic()
+            else:
+                return self.reply(404, {"error": "not found"})
+        ui.wake.set()
+        self.reply(200, ui.api_state())
+
+
+def serve_api(ui):
+    Api.ui = ui
+    try:
+        server = http.server.ThreadingHTTPServer(API_ADDR, Api)
+    except OSError:
+        return  # port taken: run without the API
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
 def main():
     ui = UI()
     Touch(ui.on_tap).start()
+    serve_api(ui)
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     while True:
         data = to_rgb565(ui.render())
