@@ -227,6 +227,21 @@ earlier community work:
 - [saper-2/rpi-spi-lcd35-kedei](https://github.com/saper-2/rpi-spi-lcd35-kedei)
   – overview of all KeDei versions
 
+## ILI9486 variant of the v6.3 board
+
+Some boards sold as "v6.3 2018/4/9" have an ILI9486-type controller instead
+of the 0x10E2 panel. With the default init, orientation and colours respond,
+but greys show almost white and photos look like negatives (power and gamma
+are never set). Select the ILI9486 init with a systemd override:
+
+    sudo systemctl edit kedei-lcd
+
+    [Service]
+    Environment=KEDEI_PANEL=ili9486
+
+Optional: `KEDEI_MADCTL` overrides orientation and colour order (default `0x60`, or
+`0xE8` with `KEDEI_PANEL=ili9486`; `0x28` rotates 180 degrees).
+
 ## License
 
 GPL-2.0, see [LICENSE](LICENSE).
